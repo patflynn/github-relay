@@ -1,0 +1,16 @@
+{
+  "id": "20260405-1311-bd21",
+  "prompt": "Tailscale Funnel strips the path prefix when using --set-path, so when Funnel is configured with '--set-path /hooks/github 8077', the relay backend receives 'POST /' instead of 'POST /hooks/github', causing a 404.\n\n**The fix:** In module.nix, change the Funnel ExecStart to mount at '/' so the full request path passes through to the relay. The relay already handles its own routing with 'POST /hooks/github' in cmd/relay/main.go.\n\nCurrent (broken):\n```\nExecStart = tailscale funnel --bg --yes --set-path /hooks/github ${toString cfg.port}\n```\n\nFix:\n```\nExecStart = tailscale funnel --bg --yes ${toString cfg.port}\n```\n\nAlso update ExecStop — currently it uses 'tailscale funnel --yes reset' which would nuke ALL funnel config. It should only remove its own entry. Check if 'tailscale funnel off' or 'tailscale funnel ${port} off' is more appropriate.\n\n**Files to change:**\n- module.nix — the systemd service ExecStart/ExecStop for github-relay-funnel\n\n**Acceptance criteria:**\n- Funnel mounts at / so the relay receives the full path (POST /hooks/github)\n- ExecStop only removes the relay's funnel entry, not all funnel config\n- The module still works as a NixOS module (test with 'nix flake check' if possible)",
+  "issue": null,
+  "branch": "agent/20260405-1311-bd21",
+  "worktree": "/tmp/klaus-sessions/github-relay/20260405-1311-bd21",
+  "tmux_pane": "%424",
+  "budget": "5.00",
+  "log_file": "/home/patrick/.klaus/sessions/session-20260405-1200-801a/logs/20260405-1311-bd21.jsonl",
+  "created_at": "2026-04-05T13:11:37-04:00",
+  "cost_usd": 0.22553825000000002,
+  "duration_ms": 44689,
+  "pr_url": "https://github.com/patflynn/github-relay/pull/4",
+  "target_repo": "github-relay",
+  "clone_dir": "/home/patrick/hack/github-relay"
+}
