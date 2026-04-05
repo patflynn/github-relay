@@ -130,8 +130,8 @@ in
       in {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecStart = "${tailscale} funnel --bg --yes --set-path /hooks/github ${toString cfg.port}";
-        ExecStop = "${tailscale} funnel --yes reset";
+        ExecStart = "${tailscale} funnel --bg --yes ${toString cfg.port}";
+        ExecStop = "${tailscale} funnel ${toString cfg.port} off";
       };
     };
   };
