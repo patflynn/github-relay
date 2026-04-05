@@ -120,11 +120,19 @@ in
 
     services.tailscale.permitCertUid = lib.mkIf cfg.funnel.enable "github-relay";
 
-    services.tsnsrv.services.github-relay = lib.mkIf cfg.funnel.enable {
-      listenAddress = ":443";
-      ephemeral = false;
-      funnel = true;
-      toURL = "http://127.0.0.1:${toString cfg.port}/hooks/github";
+    systemd.services.github-relay-funnel = lib.mkIf cfg.funnel.enable {
+      description = "Tailscale Funnel for github-relay";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "tailscaled.service" "github-relay.service" ];
+      wants = [ "tailscaled.service" ];
+      serviceConfig = let
+        tailscale = lib.getExe' config.services.tailscale.package "tailscale";
+      in {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${tailscale} funnel --bg --yes --set-path /hooks/github ${toString cfg.port}";
+        ExecStop = "${tailscale} funnel --yes reset";
+      };
     };
   };
 }
