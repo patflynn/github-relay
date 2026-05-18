@@ -23,7 +23,7 @@ let
     consumers = lib.mapAttrsToList consumerToJSON cfg.consumers;
   });
 
-  relayPackage = self.packages.${pkgs.system}.default;
+  relayPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
 in
 {
   options.services.github-relay = {
