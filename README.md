@@ -22,6 +22,8 @@ GitHub ──webhook──▶ Tailscale Funnel ──▶ github-relay ──▶ 
 
 The relay is intentionally simple: validate the webhook signature, match the event against consumer rules, dispatch. No queuing, no state, no database. Consumers handle their own idempotency.
 
+Deliveries are acknowledged (200 OK) as soon as the signature is validated and consumers are matched — dispatch then runs in the background. GitHub allows roughly 10 seconds for a response and never retries a delivery it recorded as failed, so a consumer that takes longer than that (a NixOS converge, say) must not be able to hold the response open. The flip side: a failing consumer shows up in the relay's journal (`journalctl -u github-relay`), not as a failed delivery in GitHub's webhook UI.
+
 ## NixOS module usage
 
 ```nix
@@ -106,7 +108,7 @@ The relay is intentionally simple: validate the webhook signature, match the eve
 
 | Action | Description |
 |--------|-------------|
-| `systemd` | Starts a systemd unit (oneshot). The webhook payload is passed via `GITHUB_EVENT` env var. |
+| `systemd` | Starts a systemd unit (oneshot) with `systemctl start --no-block`, so the relay returns once the job is queued rather than waiting for the unit to finish. The payload is **not** passed to the unit — use `http` or `command` if the consumer needs it. |
 | `http` | POSTs the raw webhook payload to a URL. Includes `X-GitHub-Event` and `X-GitHub-Delivery` headers. |
 | `command` | Runs a shell command. Payload available on stdin and as `GITHUB_EVENT` env var. |
 
@@ -160,8 +162,9 @@ The relay is a single Go binary (~500 lines). It reads a JSON config generated b
 
 ## Reliability
 
-- **Machine offline**: GitHub retries failed webhook deliveries for up to 3 days. Short outages (reboots, updates) are handled automatically.
-- **Consumer failure**: If a systemd unit or HTTP call fails, the relay logs the error but returns 200 to GitHub (to avoid infinite retries for consumer-side issues). Consumer services should handle their own retry logic.
+- **Machine offline**: GitHub does not retry a delivery it could not deliver, so events that arrive while the host is down are lost. Consumers that must not miss an event should reconcile on start (pull latest, re-read state) rather than rely on the webhook alone.
+- **Consumer failure**: Deliveries are acknowledged before dispatch, so a failing or slow consumer never shows up as a failed delivery in GitHub's webhook UI — look for `dispatch failed` in `journalctl -u github-relay` instead. Consumer services should handle their own retry logic.
+- **Slow consumers**: Each dispatch gets its own 60s budget, independent of GitHub's delivery timeout. On shutdown the relay waits for in-flight dispatches before exiting.
 - **Startup ordering**: The module sets `after = [ "tailscaled.service" ]` to ensure Tailscale is ready before the relay starts.
 
 ## Status

@@ -71,7 +71,13 @@ in
           unit = lib.mkOption {
             type = lib.types.str;
             default = "";
-            description = "Systemd unit to start (for action = 'systemd').";
+            description = ''
+              Systemd unit to start (for action = 'systemd').
+
+              Started with `systemctl start --no-block`, so the relay does not
+              wait for the unit to finish. The webhook payload is not passed to
+              the unit; use action = 'http' or 'command' if it needs the payload.
+            '';
           };
 
           url = lib.mkOption {
