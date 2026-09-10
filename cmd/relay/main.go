@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,8 +34,10 @@ func main() {
 
 	slog.Info("loaded config", "consumers", len(cfg.Consumers), "port", cfg.Port)
 
+	rl := &relay{cfg: cfg}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /hooks/github", webhookHandler(cfg))
+	mux.HandleFunc("POST /hooks/github", rl.handleWebhook)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
@@ -64,73 +67,118 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown error", "error", err)
 	}
+
+	// Deliveries are acknowledged before they are dispatched, so wait for the
+	// dispatches already in flight rather than dropping them on the floor.
+	if !rl.waitForDispatches(dispatchTimeout) {
+		slog.Warn("gave up waiting for in-flight dispatches", "timeout", dispatchTimeout)
+	}
 }
 
-func webhookHandler(cfg *config.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		event := r.Header.Get("X-GitHub-Event")
-		if event == "" {
-			http.Error(w, "missing X-GitHub-Event header", http.StatusBadRequest)
-			return
-		}
+// dispatchTimeout bounds a single consumer dispatch. It is deliberately longer
+// than GitHub's ~10s delivery timeout: dispatch runs after the delivery has been
+// acknowledged, so it is no longer racing the HTTP response.
+const dispatchTimeout = 60 * time.Second
 
-		delivery := r.Header.Get("X-GitHub-Delivery")
+type relay struct {
+	cfg *config.Config
+	wg  sync.WaitGroup
+}
 
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			slog.Error("failed to read body", "error", err)
-			http.Error(w, "failed to read body", http.StatusInternalServerError)
-			return
-		}
+// waitForDispatches blocks until every in-flight dispatch has finished, or the
+// timeout elapses. It reports whether they all finished.
+func (rl *relay) waitForDispatches(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		rl.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
 
-		// Validate signature
-		signature := r.Header.Get("X-Hub-Signature-256")
-		if err := webhook.ValidateSignature(body, signature, cfg.WebhookSecretFile); err != nil {
-			slog.Warn("signature validation failed", "error", err, "delivery", delivery)
-			http.Error(w, "invalid signature", http.StatusForbidden)
-			return
-		}
+// handleWebhook validates a delivery, acknowledges it, and then dispatches to
+// the matching consumers in the background. GitHub gives us ~10s to respond and
+// never retries a failed delivery, so a slow consumer must not be able to turn a
+// delivery we accepted into a delivery GitHub records as failed.
+func (rl *relay) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	event := r.Header.Get("X-GitHub-Event")
+	if event == "" {
+		http.Error(w, "missing X-GitHub-Event header", http.StatusBadRequest)
+		return
+	}
 
-		// Parse payload for matching
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			slog.Error("failed to parse payload", "error", err, "delivery", delivery)
-			http.Error(w, "invalid JSON payload", http.StatusBadRequest)
-			return
-		}
+	delivery := r.Header.Get("X-GitHub-Delivery")
 
-		repo := config.ExtractRepo(payload)
-		branch := config.ExtractBranch(event, payload)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		slog.Error("failed to read body", "error", err)
+		http.Error(w, "failed to read body", http.StatusInternalServerError)
+		return
+	}
 
-		slog.Info("received webhook",
-			"event", event,
-			"delivery", delivery,
-			"repo", repo,
-			"branch", branch,
-		)
+	// Validate signature
+	signature := r.Header.Get("X-Hub-Signature-256")
+	if err := webhook.ValidateSignature(body, signature, rl.cfg.WebhookSecretFile); err != nil {
+		slog.Warn("signature validation failed", "error", err, "delivery", delivery)
+		http.Error(w, "invalid signature", http.StatusForbidden)
+		return
+	}
 
-		// Match consumers
-		matched := config.Match(cfg.Consumers, repo, event, branch)
-		if len(matched) == 0 {
-			slog.Debug("no matching consumers", "event", event, "repo", repo)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+	// Parse payload for matching
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		slog.Error("failed to parse payload", "error", err, "delivery", delivery)
+		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
+		return
+	}
 
-		slog.Info("dispatching to consumers", "count", len(matched))
+	repo := config.ExtractRepo(payload)
+	branch := config.ExtractBranch(event, payload)
 
-		// Dispatch to all matching consumers
-		for _, consumer := range matched {
-			if err := dispatch.Dispatch(r.Context(), consumer, body, event, delivery); err != nil {
-				// Log error but return 200 to GitHub to avoid retry storms
+	slog.Info("received webhook",
+		"event", event,
+		"delivery", delivery,
+		"repo", repo,
+		"branch", branch,
+	)
+
+	// Match consumers
+	matched := config.Match(rl.cfg.Consumers, repo, event, branch)
+	if len(matched) == 0 {
+		slog.Debug("no matching consumers", "event", event, "repo", repo)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	slog.Info("dispatching to consumers", "count", len(matched), "delivery", delivery)
+
+	// Acknowledge before dispatching: the delivery is valid and accepted, and
+	// whether a consumer succeeds is our problem, not GitHub's.
+	w.WriteHeader(http.StatusOK)
+
+	for _, consumer := range matched {
+		rl.wg.Add(1)
+		go func() {
+			defer rl.wg.Done()
+
+			// Detached from the request context, which is cancelled as soon as
+			// the response above is written.
+			ctx, cancel := context.WithTimeout(context.Background(), dispatchTimeout)
+			defer cancel()
+
+			if err := dispatch.Dispatch(ctx, consumer, body, event, delivery); err != nil {
 				slog.Error("dispatch failed",
 					"consumer", consumer.Name,
 					"action", consumer.Action,
+					"delivery", delivery,
 					"error", err,
 				)
 			}
-		}
-
-		w.WriteHeader(http.StatusOK)
+		}()
 	}
 }

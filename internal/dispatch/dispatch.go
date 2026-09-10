@@ -36,12 +36,20 @@ func dispatchSystemd(ctx context.Context, consumer config.Consumer, payload []by
 
 	slog.Info("starting systemd unit", "consumer", consumer.Name, "unit", consumer.Unit)
 
-	cmd := exec.CommandContext(ctx, "systemctl", "start", consumer.Unit)
+	// --no-block: systemctl returns as soon as the start job is enqueued instead of
+	// waiting for the unit to finish. Without it a long-running oneshot (a NixOS
+	// converge, say) outlives the dispatch deadline and we kill systemctl and log a
+	// failure for a unit that is running fine.
+	cmd := exec.CommandContext(ctx, "systemctl", "start", "--no-block", consumer.Unit)
+	// Note: this does not reach the unit. systemctl only asks PID 1 to start the
+	// job, and the unit's environment comes from its own unit file, so GITHUB_EVENT
+	// is only visible to the systemctl process itself. Units that need the payload
+	// should use an http or command consumer instead.
 	cmd.Env = append(cmd.Environ(), "GITHUB_EVENT="+string(payload))
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl start %s: %w: %s", consumer.Unit, err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("systemctl start --no-block %s: %w: %s", consumer.Unit, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
